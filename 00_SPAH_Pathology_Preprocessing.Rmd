@@ -1,0 +1,228 @@
+---
+title: "SPAH Pathology Project Processing"
+author: "Hannah Illing"
+date: "`r format(Sys.time(), '%Y %B %d')`"
+output: 
+  html_document:
+    code_folding: show
+    keep_md: yes
+    toc: true  
+    toc_depth: 5
+    toc_float: 
+      collapsed: true 
+      smooth_scroll: true
+---
+
+## 0.0 Set-up
+
+### 0.1 Packages
+
+```{r libraries, message=F,warning=F}
+
+library(here)
+library(tidyverse)
+library(wateRmelon)
+library(readxl)
+library(minfi)
+
+#load the probe information
+probeInfo <- as.data.frame(cbind(IlluminaHumanMethylationEPICanno.ilm10b5.hg38::Manifest,             
+                                 IlluminaHumanMethylationEPICanno.ilm10b5.hg38::Locations,              
+                                 IlluminaHumanMethylationEPICanno.ilm10b5.hg38::Other)) 
+probeInfo$probeID <- rownames(probeInfo)
+
+chrXprobes <- probeInfo %>% filter(chr == "chrX")
+chrYprobes <- probeInfo %>% filter(chr == "chrY")
+autoProbes <- probeInfo %>% filter(!(chr %in% c("chrX", "chrY")))
+
+set.seed(4815) #set seed for script so we get the same result every time it is run
+
+```
+
+## 1.0 Read in the Data 
+
+Compilation of sample sheet, metadata and clinical information files is not shown in this script. Epivariable estimation and quality control checks were performed in another script. 
+
+In the SPAH dataset there were 520 samples in total run on the Illumina EPIC v1.0 array. Of those 520 samples there were 509 unique placentas sampled and 11 duplicates. Prior to this script 10 samples were removed during the initial QC checks for this dataset: 8 samples were run as a preliminary test and used a different sampling strategy, thus were removed; 2 samples failed numerous QC checks (low fluorescence intensity, Illumina control probes, >1% of probes failing). At the end of this script I remove an additional 17 samples that failed other checks (n=5 sex-mismatches, n=1 likely CPM17, n=8 different sampling strategy, n=3 duplicates).
+
+```{r metadata}
+
+metadata_SPAH <- readRDS(here::here("C. Processing/02_Outputs/00_Metadata/SPAH_updated_metadata.rds"))
+dim(metadata_SPAH) #507 x 95
+
+array_qc_ss <- readRDS(here::here("C. Processing/02_Outputs/00_Metadata/SPAH_updated_array_qc_ss.rds")) 
+dim(array_qc_ss) #510 x 51, includes 3 replicate samples
+
+#check the ids match
+table(metadata_SPAH$ID %in% array_qc_ss$Sample_ID)
+
+metadata_SPAH_ss <- array_qc_ss %>% left_join(metadata_SPAH, by=c("Sample_ID"="ID"))
+
+```
+
+## 2.0 Normalization 
+
+```{r dasen-noob}
+
+rgset_raw <- readRDS("//fs/teams/RobinsonLab/ROBLAB6 InfiniumSequenom/EPIC Batch Analysis Code and QC/EPICv1_Batch10_MILLER_code_qc/02_Output/00_Miller_ArrayQC/rgset_all_samples.rds")
+dim(rgset_raw) #1051943     520
+
+rgset_raw <- rgset_raw[,metadata_SPAH_ss$rgset_colnames]
+dim(rgset_raw) # x 510
+
+mset_noob <- preprocessNoob(rgset_raw)
+mset_dasnoob <- wateRmelon::dasen(mset_noob)
+betas_dasnoob <- getBeta(mset_dasnoob)
+
+```
+
+## 3.0 Probe Filtering
+
+### 3.1 SNP (rs) probes
+
+```{r rs-probes}
+rs <- getSnpBeta(rgset_raw) #get the beta values for the 59 rs SNP probes
+dim (rs) #59
+
+table(rownames(rs) %in% rownames(betas_dasnoob)) #FALSE, indicates they have been removed
+
+```
+
+### 3.2 Filter to b5 Manifest
+
+```{r b5-probes}
+
+#check the chip numbers to see if we should use the b4 or b5 manifest
+table(metadata_SPAH_ss$Sentrix_ID > 204220330001) #all are true so use b5 manifest
+
+#remove the bad b4 probes labeled in the MFG_Change_Flagged column
+probeInfo_b5 <- probeInfo %>% filter(!MFG_Change_Flagged ==TRUE)
+dim(probeInfo_b5) #864869  
+
+table(rownames(betas_dasnoob) %in% probeInfo_b5$probeID)
+b5_probes <- rownames(betas_dasnoob) %in% probeInfo_b5$probeID
+betas_dasnoob_filt <- betas_dasnoob[b5_probes,] 
+dim(betas_dasnoob_filt) #864869
+
+```
+
+### 3.3 Polymorphic & cross-hybridizing probes
+
+The EPIC zhou annotation object for this script was downloaded April 30, 2024. We selected the hg38 manifest. Downloaded from [here](https://zwdzwd.github.io/InfiniumAnnotation) 
+
+```{r pm-ch-probes-1}
+
+zhou_mask <- read.delim(here::here("B. Data/B. Reference Data/EPIC.hg38.mask.tsv.gz")) #newer masking info
+dim(zhou_mask)#865918
+
+zhou_anno <- read.delim(here::here("B. Data/B. Reference Data/EPIC.hg38.manifest.tsv.gz")) #newer annotation info
+dim(zhou_anno) #866553 
+
+# Determine how many probes will be removed if we remove everything from the MASK_general column
+table(zhou_mask$MASK_general) #105454 probes will be removed with MASK_general
+zhou_maskgeneral <- zhou_mask %>% filter(MASK_general) #save the MASK_general probes in a new object
+
+dim(betas_dasnoob_filt) #
+table(rownames(betas_dasnoob_filt) %in% zhou_maskgeneral$probeID) 
+betas_dasnoob_filt <- betas_dasnoob_filt[!(rownames(betas_dasnoob_filt) %in% zhou_maskgeneral$probeID),]
+dim(betas_dasnoob_filt) #
+
+```
+
+### 3.4 DetP and Beadcount
+
+We remove poor quality probes with a detection P-value > 0.01 in more than 5% of samples. 
+
+```{r bad-probes-1}
+
+# get the detection P (detP) values from the raw rgset.  
+detP <- minfi::detectionP(rgset_raw) 
+detP <- detP[rownames(detP) %in% probeInfo_b5$probeID,] #filter to b5 probes
+dim(detP) #864869
+
+# rather than actually sex-stratifying for the detP probes I am going to change 
+# all the female Y chromosome values to 0 so that they aren't considered for detP removal 
+metadata_SPAH_ss_f <- metadata_SPAH_ss %>% filter(Sex_Predic == "XX")
+
+f_detP <- detP #make an object where we will modifty the detP value in females 
+f_detP[rownames(f_detP) %in% chrYprobes$probeID, colnames(f_detP) %in% metadata_SPAH_ss_f$rgset_colnames] <- 0
+femaleYdetP <- f_detP[rownames(f_detP) %in% chrYprobes$probeID, colnames(f_detP) %in% metadata_SPAH_ss_f$rgset_colnames]
+all(femaleYdetP == 0) #check this step worked
+
+failed_detP <- f_detP > 0.01 #get a matrix of how many probes failed detP
+
+#get the beadcount values from the raw rgset
+beadcount <- wateRmelon::beadcount(rgset_raw)
+head(colnames(beadcount))#check the colnames of the beadcount object. An X is added
+colnames(beadcount) <- gsub("X","",colnames(beadcount))
+head(colnames(beadcount)) #fixed :)
+beadcount <- beadcount [rownames(beadcount) %in% probeInfo_b5$probeID,] #filter to b5 probes
+dim(beadcount) #864869
+identical(rownames(betas_dasnoob), rownames(beadcount)) #check
+
+betas_raw <- preprocessRaw(rgset_raw)
+
+# create an logical matrix with which probes failed a check (true = fail)
+# sum to see if a probe failed any checks (false + false = 0)
+failed_probes <- failed_detP + is.na(beadcount) + is.na(betas_raw)
+failed_probes <- failed_probes > 0 # >0 means failed any of the checks
+table(rowSums(failed_probes) >= (nrow(metadata_SPAH)*0.05)) #12737 probes to remove
+
+# index them for removal
+badprobes <- data.frame(probebad = rowSums(failed_probes) >= nrow(metadata_SPAH)*0.05) %>% filter(probebad == TRUE)
+dim(badprobes) #12737
+
+## Remove the probes from the betas object
+dim(betas_dasnoob_filt)
+betas_dasnoob_filt <- betas_dasnoob_filt[!(row.names(betas_dasnoob_filt) %in% rownames(badprobes)),]
+dim(betas_dasnoob_filt) #
+
+```
+
+### 3.5 X and Y Specific Poor Probes
+
+```{r xy-bad-probes}
+#load additional X and Y annotation info
+chrXY_ext <- read.csv(here::here("B. Data/B. Reference Data/Inkster_extended_XY_probe_annotation.csv"),header = T, fileEncoding="UTF-8-BOM")
+
+bad_xy_probes <- chrXY_ext %>% filter(MASK_X_transposed_region == TRUE |
+                                        MASK_AnyRepetitive == TRUE)
+dim(bad_xy_probes) #726
+table(rownames(betas_dasnoob_filt) %in% bad_xy_probes$probeID) #475
+
+#subset the methylation object
+betas_dasnoob_filt <- betas_dasnoob_filt[!rownames(betas_dasnoob_filt) %in% bad_xy_probes$probeID,]
+dim(betas_dasnoob_filt)  #748281
+
+```
+
+## 4.0 Remove Samples that failed QC checks
+
+```{r remove-samples}
+
+remove_samps <- read_xlsx(here::here("C. Processing/02_Outputs/01_QC_Preprocessing/SPAH_remove_samples_list.xlsx")) 
+table(metadata_SPAH_ss$Sample_ID %in% remove_samps$Sample_ID)
+
+metadata_SPAH_ss_filt <- metadata_SPAH_ss %>% filter(!Sample_ID %in% remove_samps$Sample_ID)
+dim(metadata_SPAH_ss_filt) #496
+
+#remove remaining replicate samples
+metadata_SPAH_ss_filt <- metadata_SPAH_ss_filt %>% filter(!grepl("-redo",NUSeq_Core_Facility_ID))
+dim(metadata_SPAH_ss_filt) #493
+
+#subset the methylation object
+betas_dasnoob_filt <- betas_dasnoob_filt[,colnames(betas_dasnoob_filt) %in% metadata_SPAH_ss_filt$rgset_colnames]
+dim(betas_dasnoob_filt)
+
+saveRDS(betas_dasnoob_filt, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/SPAH_dasen_noob.rds"))
+saveRDS(metadata_SPAH_ss_filt, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/SPAH_metadata_ss_filtered.rds"))
+
+```
+
+## sessionInfo()
+
+```{r}
+
+sessionInfo()
+
+```

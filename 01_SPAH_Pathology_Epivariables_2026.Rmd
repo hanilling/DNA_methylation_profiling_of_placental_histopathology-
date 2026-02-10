@@ -1,0 +1,466 @@
+---
+title: "SPAH Placental Pathologies and Epivariables"
+author: "Hannah Illing"
+date: "`r format(Sys.time(), '%Y %B %d')`"
+output: 
+  html_document:
+    keep_md: yes
+    code_folding: show
+    toc: true  
+    toc_depth: 4
+    toc_float: 
+      collapsed: true 
+      smooth_scroll: true
+---
+  
+## 0.0 Set-up
+
+### 0.1 Load Packages 
+
+```{r packages, message=F,warning=F}
+
+library(here)
+library(tidyverse)
+library(ggpubr)
+library(plomics)
+library(cowplot)
+library(rstatix)
+library(jtools)
+library(tableone)
+library(Hmisc)
+library(corrplot)
+library(betareg)
+
+set.seed(4815)
+
+```
+
+### 0.2 Style Guide
+
+```{r style}
+
+#set document style
+theme_set(theme_minimal())
+theme_update(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(), 
+  axis.line = element_line(colour = "black"),
+  axis.title.x = element_text(size = 16),
+  axis.title.y = element_text(size = 16),
+  axis.text = element_text(size = 14),
+  strip.text= element_text(size = 16, color = "black"),
+  legend.position="none"
+)
+
+
+#categories <- c("#5e356e","#de8e04","#35666e","grey33") 
+categories <- c("#bf4e52","#631215","grey55","grey22") 
+categories2 <- c("darkgrey","#D3AB04","#e05600","#3b6b4a","#033F63")
+mvm_pal<- c("#87b8d6","#6099bd","#407799","#033F63","#02253B")
+fvm_pal <- c("#7aa387","#5d966f","#3b6b4a","#114020")
+ai_pal <- c("darkgrey","#FCDC5F","#D3AB04")
+ci_pal <- c("darkgrey","#e38c56","#e05600")
+
+```
+
+### 0.3 Load Data
+
+```{r data}
+
+metadata <- readRDS(here::here("D. Pathology Project/02_Outputs/AA. Cleaned/SPAH_metadata_ss_filtered.rds"))
+dim(metadata) #493 x 162
+
+#fix some variable classes
+metadata <- metadata %>%
+  mutate(Sex_Predic = as.factor(Sex_Predic),
+         EOPE_class = as.factor(PE_GA_state == "EOPE"),
+         LOPE_class = as.factor(PE_GA_state == "LOPE"),
+         primi_gravida = as.factor(pcr_gravida == "1"),
+         primi_para = as.factor(parity == "0"),
+         Placenta_SGAvAGAvLGA = as.factor(Placenta_SGAvAGAvLGA),
+         Feto_placental_wt = pcr_birth_wt/Placental_wt,
+         pcr_diabetes_any = as.factor(pcr_diabetes_any),
+         Race_AmIndALNative = as.factor(Race_AmIndALNative),
+         Race_Asian = as.factor(Race_Asian),
+         Race_Black = as.factor(Race_Black),
+         Race_HINativePacIsl = as.factor(Race_HINativePacIsl), 
+         Race_white = as.factor(Race_white),
+         Race_Other = as.factor(Race_Other),
+         Ethnicity_HispYN = as.factor(Ethnicity_HispYN),
+         acute_inflammation_3cat = as.factor(acute_inflammation_3cat),
+         chronic_inflammation_3cat = as.factor(chronic_inflammation_3cat)) %>% 
+#note that one sample is mistakenly labelled as FVM in the FETAL_VASC_PATH column
+#Use the FETAL_VASC_PATH column to create an updated FETAL_VASC_PATH variable
+  mutate(FETAL_VASC_PATH = as.factor(ifelse(Fetal_vasc_path_3cat==0,0,1))) %>%
+  mutate(diabetes_pregestational.new = ifelse(diabetes_gestational == 0,1,0),
+         diabetes_gestational.new = ifelse(diabetes_pregestational == "0",1,0))
+
+```
+## 1.0 Tables 
+
+### 1.1 Table 1
+
+```{r table-1}
+
+metadata_filt <- metadata %>% filter(!is.na(HarmonizedPath))
+dim(metadata_filt) #9 samples removed
+
+metadata_filt <- metadata_filt %>%
+  mutate(NoPath = ifelse(HarmonizedPath == "No Pathology","No Path","Path"))
+
+myVars <- c("Sex_Predic", "ga_continuous", "Bw_call",
+  "pcr_pre_eclampsia", "pcr_diabetes_any", "primi_para",
+  "Age", "HarmonizedRace", "Ethnicity_HispYN","ACUTE_INFLAMMATION",
+  "acute_inflammation_3cat", "CHRONIC_INFLAMMATION",
+  "chronic_inflammation_3cat", "FETAL_VASC_PATH", "Fetal_vasc_path_3cat",
+  "mvm_di", "mvm_score_3cat")
+
+catVars <- c("Sex_Predic", "Bw_call",
+  "pcr_pre_eclampsia", "pcr_diabetes_any", "primi_para",
+  "HarmonizedRace", "Ethnicity_HispYN","ACUTE_INFLAMMATION",
+  "acute_inflammation_3cat", "CHRONIC_INFLAMMATION",
+  "chronic_inflammation_3cat", "FETAL_VASC_PATH", "Fetal_vasc_path_3cat",
+  "mvm_di", "mvm_score_3cat")
+
+CreateTableOne(vars = myVars, data = metadata_filt, factorVars = catVars)
+
+```
+
+## 2.0 Figure 1
+
+```{r figure-1}
+
+metadata_filter <- metadata %>% 
+  filter(!is.na(HarmonizedPath))%>%
+  dplyr::rename(CTB = Trophoblasts,
+                  STB = Syncytiotrophoblast) %>%
+    pivot_longer(cols=c(CTB,
+                        STB,
+                        Hofbauer,
+                        Endothelial,
+                        nRBC,
+                        Stromal),
+                 names_to = "Cell_Type", values_to="Estimate") %>%
+    mutate(Cell_Type = factor(Cell_Type,
+                              levels=c("nRBC", "Hofbauer", "Endothelial",
+                                       "Stromal", "CTB", "STB")))
+
+fig_1_a <- metadata_filter %>%
+  ggplot(aes(x = Cell_Type, y = Estimate, fill = mvm_di))+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_fill_manual(values = c("darkgrey", "#147ab8"), labels=c("No","Yes"))+
+  labs(x="Cell Estimate", y="Proportion of Sample", fill="MVM")+
+  theme(axis.text = element_text(size=15, color="black"),
+        strip.text = element_text(
+        size = 15, color = "black", face = "bold"),
+        legend.position="bottom",
+        legend.text = element_text(size=13),
+        legend.title = element_text(size=15))+
+  ylim(0,1)
+
+fig_1_b <- metadata_filter %>%
+  filter(!mvm_score_3cat == 1) %>%
+  ggplot(aes(x = Cell_Type, y = Estimate, fill = mvm_score_3cat))+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_color_manual(values = c("darkgrey", "#147ab8"), guide="none")+
+  scale_fill_manual(values = c("darkgrey", "#147ab8"), labels=c("No MVM","High-grade MVM"))+
+  labs(x="Cell Estimate", y="Proportion of Sample", fill="MVM")+
+  theme(axis.text = element_text(size=15, color="black"),
+        strip.text = element_text(
+        size = 15, color = "black", face = "bold"),
+        legend.position="bottom",
+        legend.text = element_text(size=13),
+        legend.title = element_text(size=15))+
+  annotate(geom="text",label = "***", x=2,y=0.96, size=7)+
+  annotate(geom="text",label = "**", x=4,y=0.96, size=7)+
+  ylim(0,1)
+
+
+fig_1_c <- metadata_filter %>%
+  ggplot(aes(x = Cell_Type, y = Estimate, fill = FETAL_VASC_PATH))+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_fill_manual(values = c("darkgrey", "#2ea353"), labels=c("No","Yes"))+
+  labs(x="Cell Estimate", y="Proportion of Sample", fill="FVM")+
+  theme(axis.text = element_text(size=15, color="black"),
+        strip.text = element_text(
+        size = 15, color = "black", face = "bold"),
+        legend.position="bottom",
+        legend.text = element_text(size=13),
+        legend.title = element_text(size=15))+
+  annotate(geom="text",label = "***", x=2,y=0.96, size=7)+
+  ylim(0,1)
+
+fig_1_d <- metadata_filter %>%
+  filter(!Fetal_vasc_path_3cat == 1) %>%
+  ggplot(aes(x = Cell_Type, y = Estimate, fill = Fetal_vasc_path_3cat))+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_fill_manual(values = c("darkgrey", "#2ea353"), labels=c("No","High-grade"))+
+  labs(x="Cell Estimate", y="Proportion of Sample", fill="FVM")+
+  theme(axis.text = element_text(size=15, color="black"),
+        strip.text = element_text(
+        size = 15, color = "black", face = "bold"),
+        legend.position="bottom",
+        legend.text = element_text(size=13),
+        legend.title = element_text(size=15))+
+  annotate(geom="text",label = "*", x=2,y=0.96, size=7)+
+  ylim(0,1)
+
+
+fig_1 <- plot_grid(fig_1_a, NULL, fig_1_b, 
+                   NULL, NULL, NULL,
+                fig_1_c, NULL, fig_1_d,
+                   labels = c("A.","","B.","","","","C.","","D."), nrow = 3, ncol=3,
+                   rel_widths = c(1,0.1,1), rel_heights = c(1,0.1,1))
+
+fig_1
+
+ggsave("Figure 1_2026.png", plot = fig_1, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 15, height =9, device = "png")
+
+```
+
+## 3.0 Beta-Regressions
+
+```{r beta-regression}
+
+metadata_naomit <- metadata_filt %>%
+  filter(!PE_GA_state == "EOPE") %>%
+  filter(!is.na(ga_continuous))
+
+## Individual Cell Types by AI
+#AI ~ GA + STB
+fit_ai_stb <- betareg(Syncytiotrophoblast ~ ACUTE_INFLAMMATION + ga_continuous, data = metadata_naomit)
+summary(fit_ai_stb)
+
+#AI ~ GA + CTB
+fit_ai_ctb <- betareg(Trophoblasts ~ ACUTE_INFLAMMATION + ga_continuous, data = metadata_naomit)
+summary(fit_ai_ctb)
+
+#AI ~ GA + Endothelial
+fit_ai_end <- betareg(Endothelial ~ ACUTE_INFLAMMATION + ga_continuous, data = metadata_naomit)
+summary(fit_ai_end)
+
+#AI ~ GA + Stromal
+fit_ai_str <- betareg(Stromal ~ ACUTE_INFLAMMATION + ga_continuous, data = metadata_naomit)
+summary(fit_ai_str)
+
+#AI ~ GA + nRBC
+fit_ai_rbc <- betareg(nRBC ~ ACUTE_INFLAMMATION + ga_continuous, data = metadata_naomit)
+summary(fit_ai_rbc)
+
+#AI ~ GA + Hofbauer
+fit_ai_hbc <- betareg(Hofbauer ~ ACUTE_INFLAMMATION + ga_continuous, data = metadata_naomit)
+summary(fit_ai_hbc)
+
+## Individual Cell Types by High-Grade AI
+ai_grade <- metadata_naomit %>%
+  filter(!acute_inflammation_3cat == 1) 
+table(ai_grade$acute_inflammation_3cat)
+
+#AI ~ GA + STB
+fit_hgai_stb <- betareg(Syncytiotrophoblast ~ ACUTE_INFLAMMATION + ga_continuous, data = ai_grade)
+summary(fit_hgai_stb)
+
+#AI ~ GA + CTB
+fit_hgai_ctb <- betareg(Trophoblasts ~ ACUTE_INFLAMMATION + ga_continuous, data = ai_grade)
+summary(fit_hgai_ctb)
+
+#AI ~ GA + Endothelial
+fit_hgai_end <- betareg(Endothelial ~ ACUTE_INFLAMMATION + ga_continuous, data = ai_grade)
+summary(fit_hgai_end)
+
+#AI ~ GA + Stromal
+fit_hgai_str <- betareg(Stromal ~ ACUTE_INFLAMMATION + ga_continuous, data = ai_grade)
+summary(fit_hgai_str)
+
+#AI ~ GA + nRBC
+fit_hgai_rbc <- betareg(nRBC ~ ACUTE_INFLAMMATION + ga_continuous, data = ai_grade)
+summary(fit_hgai_rbc)
+
+#AI ~ GA + Hofbauer
+fit_hgai_hbc <- betareg(Hofbauer ~ ACUTE_INFLAMMATION + ga_continuous, data = ai_grade)
+summary(fit_hgai_hbc)
+
+
+## Individual Cell Types by MVM
+#MVM ~ GA + STB
+fit_mvm_stb <- betareg(Syncytiotrophoblast ~ mvm_di + ga_continuous, data = metadata_naomit)
+summary(fit_mvm_stb)
+
+#MVM ~ GA + CTB
+fit_mvm_ctb <- betareg(Trophoblasts ~ mvm_di + ga_continuous, data = metadata_naomit)
+summary(fit_mvm_ctb)
+
+#MVM ~ GA + Endothelial
+fit_mvm_end <- betareg(Endothelial ~ mvm_di + ga_continuous, data = metadata_naomit)
+summary(fit_mvm_end)
+
+#MVM ~ GA + Stromal
+fit_mvm_str <- betareg(Stromal ~ mvm_di + ga_continuous, data = metadata_naomit)
+summary(fit_mvm_str)
+
+#MVM ~ GA + nRBC
+fit_mvm_rbc <- betareg(nRBC ~ mvm_di + ga_continuous, data = metadata_naomit)
+summary(fit_mvm_rbc)
+
+#MVM ~ GA + Hofbauer
+fit_mvm_hbc <- betareg(Hofbauer ~ mvm_di + ga_continuous, data = metadata_naomit)
+summary(fit_mvm_hbc)
+
+## Individual Cell Types by High-grade MVM
+mvm_grade <- metadata_naomit %>%
+  filter(!mvm_score_3cat == 1) 
+
+#MVM ~ GA + STB
+fit_hgmvm_stb <- betareg(Syncytiotrophoblast ~ mvm_di + ga_continuous, data = mvm_grade)
+summary(fit_hgmvm_stb)
+
+#MVM ~ GA + CTB
+fit_hgmvm_ctb <- betareg(Trophoblasts ~ mvm_di + ga_continuous, data = mvm_grade)
+summary(fit_hgmvm_ctb)
+
+#MVM ~ GA + Endothelial
+fit_hgmvm_end <- betareg(Endothelial ~ mvm_di + ga_continuous, data = mvm_grade)
+summary(fit_hgmvm_end)
+
+#MVM ~ GA + Stromal
+fit_hgmvm_str <- betareg(Stromal ~ mvm_di + ga_continuous, data = mvm_grade)
+summary(fit_hgmvm_str)
+
+#MVM ~ GA + nRBC
+fit_hgmvm_rbc <- betareg(nRBC ~ mvm_di + ga_continuous, data = mvm_grade)
+summary(fit_hgmvm_rbc)
+
+#MVM ~ GA + Hofbauer
+fit_hgmvm_hbc <- betareg(Hofbauer ~ mvm_di + ga_continuous, data = mvm_grade)
+summary(fit_hgai_hbc)
+
+newdat <- data.frame(
+  mvm_di = factor(c(0, 1)),
+  ga_continuous = mean(mvm_grade$ga_continuous, na.rm = TRUE)
+)
+
+pred <- predict(fit_hgmvm_stb, newdat, type = "response")
+diff(pred)
+
+```
+
+## 4.0 Supplementary Figures
+
+### 4.1 Supplementary Figure 1
+
+Does epigenetic age acceleration age differ by pathology? 
+
+```{r sup-fig-1}
+
+eaa_fig_a <- metadata %>%
+  filter(!is.na(ACUTE_INFLAMMATION))%>%
+  ggplot(aes(x=acute_inflammation_3cat, y=extAccel, color=acute_inflammation_3cat, fill=acute_inflammation_3cat))+
+  stat_compare_means(aes(group=acute_inflammation_3cat), label.x = 0.95)+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_color_manual(values=ai_pal)+
+  scale_fill_manual(values=ai_pal)+
+  labs(y="Extrinsic EAA (weeks)",x="AI grade")+
+  scale_x_discrete(labels = c("0" = "No AI", "1" = "Low-Grade AI", "2" = "High-Grade AI"))+
+  ylim(-2.7,3.5)
+
+eaa_fig_b <- metadata %>%
+  filter(!is.na(ACUTE_INFLAMMATION))%>%
+  ggplot(aes(x=acute_inflammation_3cat, y=intAccel, color=acute_inflammation_3cat, fill=acute_inflammation_3cat))+
+  stat_compare_means(aes(group=acute_inflammation_3cat), label.x = 0.95)+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_color_manual(values=ai_pal)+
+  scale_fill_manual(values=ai_pal)+
+  labs(y="Intrinsic EAA (weeks)",x="AI grade")+
+  scale_x_discrete(labels = c("0" = "No AI", "1" = "Low-Grade AI", "2" = "High-Grade AI"))+
+  ylim(-2.7,3.5)
+
+eaa_fig_c <- metadata %>%
+  filter(!is.na(CHRONIC_INFLAMMATION))%>%
+  ggplot(aes(x=chronic_inflammation_3cat, y=extAccel, color=chronic_inflammation_3cat, fill=chronic_inflammation_3cat))+
+  stat_compare_means(aes(group=chronic_inflammation_3cat), label.x = 0.95)+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_color_manual(values=ci_pal)+
+  scale_fill_manual(values=ci_pal)+
+  labs(y="Extrinsic EAA (weeks)",x="CI grade")+
+  scale_x_discrete(labels = c("0" = "No CI", "1" = "Low-Grade CI", "2" = "High-Grade CI"))+
+  ylim(-2.7,3.5)
+
+eaa_fig_d <- metadata %>%
+  filter(!is.na(CHRONIC_INFLAMMATION))%>%
+  ggplot(aes(x=chronic_inflammation_3cat, y=intAccel, color=chronic_inflammation_3cat, fill=chronic_inflammation_3cat))+
+  stat_compare_means(aes(group=chronic_inflammation_3cat), label.x = 0.95)+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_color_manual(values=ci_pal)+
+  scale_fill_manual(values=ci_pal)+
+  labs(y="Intrinsic EAA (weeks)",x="CI grade")+
+  scale_x_discrete(labels = c("0" = "No CI", "1" = "Low-Grade CI", "2" = "High-Grade CI"))+
+  ylim(-2.7,3.5)
+
+eaa_fig_e <- metadata %>%
+  filter(!is.na(FETAL_VASC_PATH))%>%
+  ggplot(aes(x=Fetal_vasc_path_3cat, y=extAccel, color=Fetal_vasc_path_3cat, fill=Fetal_vasc_path_3cat))+
+  stat_compare_means(aes(group=Fetal_vasc_path_3cat), label.x = 0.95)+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_color_manual(values=c("darkgrey",fvm_pal[1],fvm_pal[3]))+
+  scale_fill_manual(values=c("darkgrey",fvm_pal[1],fvm_pal[3]))+
+  labs(y="Extrinsic EAA (weeks)",x="FVM grade")+
+  scale_x_discrete(labels = c("0" = "No FVM", "1" = "Low-Grade FVM", "2" = "High-Grade FVM"))+
+  ylim(-2.7,3.5)
+
+eaa_fig_f <- metadata %>%
+  filter(!is.na(FETAL_VASC_PATH))%>%
+  ggplot(aes(x=Fetal_vasc_path_3cat, y=intAccel, color=Fetal_vasc_path_3cat, fill=Fetal_vasc_path_3cat))+
+  stat_compare_means(aes(group=Fetal_vasc_path_3cat), label.x = 0.95)+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_color_manual(values=c("darkgrey",fvm_pal[1],fvm_pal[3]))+
+  scale_fill_manual(values=c("darkgrey",fvm_pal[1],fvm_pal[3]))+
+  labs(y="Intrinsic EAA (weeks)",x="FVM grade")+
+  scale_x_discrete(labels = c("0" = "No FVM", "1" = "Low-Grade FVM", "2" = "High-Grade FVM"))+
+  ylim(-2.7,3.5)
+
+eaa_fig_g <- metadata %>%
+  filter(!is.na(mvm_di))%>%
+  ggplot(aes(x=mvm_score_3cat, y=extAccel, color = mvm_score_3cat, fill= mvm_score_3cat))+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_fill_manual(values = c(categories2[1],mvm_pal[3], mvm_pal[4]))+
+  scale_color_manual(values = c(categories2[1],mvm_pal[3],mvm_pal[4]))+
+  labs(x="MVM Grade", y="Extrinsic EAA (weeks)")+
+  stat_compare_means(aes(group=mvm_score_3cat), label.x = 0.95)+
+  scale_x_discrete(labels = c("0" = "No MVM", "1" = "Low-Grade MVM", "2" = "High-Grade MVM"))+
+  ylim(-2.7,3.5)
+
+eaa_fig_h <- metadata %>%
+  filter(!is.na(mvm_di))%>%
+  ggplot(aes(x=mvm_score_3cat, y=intAccel, color = mvm_score_3cat, fill= mvm_score_3cat))+
+  geom_point(alpha=0.5, position=position_jitterdodge(jitter.width=0.2),size=3)+
+  geom_boxplot(alpha=0.5, outlier.shape = NA)+
+  scale_fill_manual(values = c(categories2[1],mvm_pal[3], mvm_pal[4]))+
+  scale_color_manual(values = c(categories2[1],mvm_pal[3],mvm_pal[4]))+
+  labs(x="MVM Grade", y="Intrinsic EAA (weeks)")+
+  stat_compare_means(aes(group=mvm_score_3cat), label.x = 0.95)+
+  scale_x_discrete(labels = c("0" = "No MVM", "1" = "Low-Grade MVM", "2" = "High-Grade MVM"))+
+  ylim(-2.7,3.5)
+
+eaa_fig <- plot_grid(eaa_fig_a, eaa_fig_b, eaa_fig_c, eaa_fig_d,
+                       eaa_fig_e, eaa_fig_f, eaa_fig_g, eaa_fig_h,
+                   labels = c("A.","B.","C.", "D.", "E.","F.", "G.","H."), 
+                   nrow = 4, ncol=2)
+
+ggsave("Figure S1.png", plot = eaa_fig, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 12, height = 14, device = "png")
+
+```
+
+## sessionInfo()
+
+```{r}
+
+sessionInfo()
+
+```
