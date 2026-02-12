@@ -1,0 +1,1383 @@
+---
+title: "SPAH Pathology Project Linear Modelling"
+author: "Hannah Illing"
+date: "`r format(Sys.time(), '%Y %B %d')`"
+output: 
+  html_document:
+    keep_md: yes
+    code_folding: show
+    toc: true  
+    toc_depth: 5
+    toc_float: 
+      collapsed: true 
+      smooth_scroll: true
+---
+
+## 0.0 Set-up
+
+### 0.1 Packages
+
+```{r libraries, warning=F, message=F}
+
+library(here)
+library(tidyverse)
+library(readxl)
+library(xlsx)
+library(limma)
+library(lumi)
+library(biobroom)
+library(cowplot)
+library(irlba)
+library(planet)
+library(ggrepel)
+library(plomics)
+library(missMethyl)
+library(bacon)
+library(ggpubr)
+
+#load Illumina b5 manifest
+probeInfo <- readRDS(here::here("E. Sex and Environment Project [abandon]/02_Outputs/02_Variability/hg38_b5_EPIC_probeinfo.rds"))
+chrXprobes <- probeInfo %>% filter(chr == "chrX")
+chrYprobes <- probeInfo %>% filter(chr == "chrY")
+autoProbes <- probeInfo %>% filter(!(chr %in% c("chrX", "chrY")))
+remove(probeInfo)
+
+set.seed(4815)
+
+theme_set(theme_minimal())
+theme_update(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(), 
+  axis.line = element_line(colour = "black"),
+  axis.title.x = element_text(size = 16),
+  axis.title.y = element_text(size = 16),
+  axis.text = element_text(size = 14),
+  strip.text= element_text(size = 16, color = "black"),
+  legend.position="none"
+)
+
+```
+
+### 0.2 Load Data
+
+1.    `metadata` - demographic and epiphenotyping variables for all **493** samples we want to include in our analysis. It includes all of the variables calculated in my pathology epivariables script.
+2.    `betas_dasnoob_filt` - dasen+noob normalized beta values from the QC and pre-processing script. Includes methylation data for **506** placentas. Needs to be filtered down to match the `metadata` object. Column names in this object match the `rgset_colnames` variable in the `metadata` object
+
+```{r data}
+
+## 1) Load the metadata
+metadata <- readRDS(here::here("D. Pathology Project/02_Outputs/AA. Cleaned/SPAH_metadata_ss_filtered.rds"))
+dim(metadata) #493 x 162
+
+## 2) load the processed betas
+betas_dasnoob_filt <- readRDS(here::here("D. Pathology Project/02_Outputs/AA. Cleaned/SPAH_dasen_noob.rds"))
+dim(betas_dasnoob_filt) #748007 x 506
+
+#filter to the correct samples
+betas_dasnoob_filt <- betas_dasnoob_filt[,metadata$rgset_colnames]
+dim(betas_dasnoob_filt) #748007 x 493
+
+all.equal(colnames(betas_dasnoob_filt), metadata$rgset_colnames) #check that the meta data and methylation data match
+
+```
+
+## 1.0 Linear Modelling Set-Up
+
+### 1.1 Function Set-up
+
+The following functions can be used to run linear models looking for associations with MVM presence/absence, perform multiple test correction by false discovery rate (FDR) and output a table of how many CpGs are significantly associated with your co-variate of interest at different effect sizes (delta B).
+
+```{r lm-functions}
+
+linear_modelling <- function(betas,mvals,model){
+  #run model on m values & calculate empirical Bayesian statistics
+  fit<- lmFit(mvals, model) %>% eBayes()
+  td <- biobroom::tidy.MArrayLM(fit) # throws a tibble warning, still works
+
+  #calculate delta beta
+  td <- td %>% mutate(delB =
+       (biobroom::tidy.MArrayLM(lmFit(betas, model) %>% 
+        eBayes()))$estimate)
+  
+  #multiple test correct
+  td <- td %>% 
+    dplyr::rename(probeID = gene) %>% #biobroom assumes tested genes, not CpGs, rename
+    group_by(term) %>%
+    mutate(fdr = p.adjust(p.value, method="fdr")) %>%
+    ungroup() %>%
+    as.data.frame() 
+  return(td)
+}
+
+lm_significant_hits <- function(td){
+  #significant hits 
+  sig_hits <- matrix(c(
+    nrow(td %>% filter(fdr<0.05)),
+    nrow(td %>% filter(fdr<0.05 & abs(delB) > 0.05)),
+    nrow(td %>% filter(fdr<0.05 & abs(delB) > 0.1)),
+    nrow(td %>% filter(fdr<0.01)),
+    nrow(td %>% filter(fdr<0.01 & abs(delB) > 0.05)),
+    nrow(td %>% filter(fdr<0.01 & abs(delB) > 0.1)))
+    ,ncol=2)
+  
+  colnames(sig_hits) <- c("FDR < 0.05", "FDR < 0.01")
+  rownames(sig_hits) <- c("delB > 0", "delB > 0.05", "delB > 0.1")
+  sig_hits <-as.table(sig_hits)
+  return(sig_hits)
+}
+
+
+```
+
+### 1.2 Object Set-up
+
+```{r lm-objects}
+
+## 1) Make the metadata object for modelling
+# 1a) Check how many samples have NAs or EOPE that would be removed for modelling
+table(metadata$PE_GA_state) #7 EOPE samples
+colSums(is.na(metadata %>%
+                dplyr::select(pcr_pre_eclampsia,
+                          HarmonizedPath, #9 samples
+                          ga_continuous)))
+
+# 1b) Select the metadata variables and remove missing data
+metadata_naomit <- metadata %>%
+  dplyr::select(Sex_Predic,
+                PE_GA_state,
+                HarmonizedPath,
+                mvm_di,
+                mvm_score_3cat,
+                FETAL_VASC_PATH,
+                Fetal_vasc_path_3cat,
+                CHRONIC_INFLAMMATION,
+                chronic_inflammation_3cat,
+                ACUTE_INFLAMMATION,
+                acute_inflammation_3cat,
+                ga_continuous,
+                Trophoblasts,
+                Syncytiotrophoblast,
+                Stromal,
+                Endothelial,
+                Hofbauer,
+                nRBC,
+                Prob_African,
+                Prob_Asian,
+                Prob_European,
+                rgset_colnames) %>%
+ #filter(!PE_GA_state == "EOPE") %>%
+  na.omit() 
+
+dim(metadata_naomit) #483 samples 
+
+
+## 3) select probes 
+## 4) convert to M-values
+
+# autosomes
+betas_auto <- na.omit(betas_dasnoob_filt [rownames(betas_dasnoob_filt) %in% autoProbes$probeID, metadata_naomit$rgset_colnames])
+mvals_auto <- lumi::beta2m(betas_auto)
+dim(mvals_auto) #732102 x 483
+
+```
+
+## 2.0 MVM
+
+### 2.1 MVM vs. No MVM
+
+```{r models-auto}
+
+table(metadata_naomit$mvm_score_3cat)
+
+## MVM modelling
+mod_mvm_auto_basic <- model.matrix(~ mvm_di, metadata_naomit,row.names=T)
+mod_mvm_auto <- model.matrix(~ mvm_di +
+                               Sex_Predic + 
+                               Prob_European + 
+                               Prob_African + 
+                               ga_continuous, 
+                             metadata_naomit,row.names=T)
+
+mod_mvm_cells <- model.matrix(~ mvm_di + 
+                                Sex_Predic + 
+                                Prob_European + 
+                                Prob_African + 
+                                Syncytiotrophoblast + 
+                                Stromal + 
+                                Endothelial + 
+                                nRBC + 
+                                ga_continuous, 
+                              metadata_naomit,row.names=T)
+
+head(mod_mvm_cells)
+
+#run models
+lm_mvm_auto_basic <-linear_modelling (betas_auto,mvals_auto,mod_mvm_auto_basic) %>% filter (term == "mvm_di1")
+lm_mvm_auto <-linear_modelling (betas_auto,mvals_auto,mod_mvm_auto) %>% filter (term == "mvm_di1")
+lm_mvm_cells <-linear_modelling (betas_auto,mvals_auto,mod_mvm_cells) %>% filter (term == "mvm_di1")
+
+#are there any significant hits? 
+lm_significant_hits(lm_mvm_auto_basic) 
+lm_significant_hits(lm_mvm_auto) 
+lm_significant_hits(lm_mvm_cells)
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_mvm_auto_basic$statistic)) #1.189345 
+inflation(bacon(teststatistics = lm_mvm_auto$statistic)) #0.935061
+inflation(bacon(teststatistics = lm_mvm_cells$statistic)) #1.089234 
+
+```
+
+### 2.2  High-grade MVM vs. No MVM
+
+Here I will run linear regressions to see which CpGs are differentially methylated in association with MVM in a comparison between samples with high grade MVM pathology (n=59) and samples with no MVM (n=340).
+
+```{r mvm-grade}
+
+table(metadata_naomit$mvm_score_3cat) #59 with high grade MVM, 340 with no MVM
+
+mvm_grade_naomit <- metadata_naomit %>% filter(!mvm_score_3cat == 1)
+dim(mvm_grade_naomit) #399 (340+59)
+
+betas_auto_mvm <- betas_auto[,mvm_grade_naomit$rgset_colnames]
+dim(betas_auto_mvm) #x 399
+mvals_auto_mvm <- mvals_auto[,mvm_grade_naomit$rgset_colnames]
+dim(mvals_auto_mvm) #x 399
+
+#set-up models
+mod_HGMVM_auto_basic <- model.matrix(~ mvm_di, mvm_grade_naomit,row.names=T)
+mod_HGMVM_auto <- model.matrix(~ mvm_di + 
+                                 Sex_Predic + 
+                                 Prob_European + 
+                                 Prob_African + 
+                                 ga_continuous, 
+                               mvm_grade_naomit,row.names=T)
+mod_HGMVM_auto_cells <- model.matrix(~ mvm_di + 
+                                       Sex_Predic + 
+                                       Prob_European + 
+                                       Prob_African + 
+                                       ga_continuous + 
+                                       Syncytiotrophoblast + 
+                                       Endothelial + 
+                                       Stromal + 
+                                       nRBC, 
+                                     mvm_grade_naomit,row.names=T)
+
+head(mod_HGMVM_auto_cells)
+
+#run models
+lm_HGMVM_auto_basic <-linear_modelling (betas_auto_mvm,mvals_auto_mvm,mod_HGMVM_auto_basic) %>% filter (term == "mvm_di1")
+lm_HGMVM_auto <-linear_modelling (betas_auto_mvm,mvals_auto_mvm,mod_HGMVM_auto) %>% filter (term == "mvm_di1")
+lm_HGMVM_auto_cells <-linear_modelling (betas_auto_mvm,mvals_auto_mvm,mod_HGMVM_auto_cells) %>% filter (term == "mvm_di1")
+
+#are there any significant hits? 
+lm_significant_hits(lm_HGMVM_auto_basic) # 1286
+lm_significant_hits(lm_HGMVM_auto) # 281 + sex + ancestry + gestational age
+lm_significant_hits(lm_HGMVM_auto_cells) # 17 + sex + ancestry + gestational age + cells
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_HGMVM_auto_basic$statistic)) #1.166218
+inflation(bacon(teststatistics = lm_HGMVM_auto$statistic)) #1.071452
+inflation(bacon(teststatistics = lm_HGMVM_auto_cells$statistic)) #1.052073 
+
+```
+
+### 2.3 Sensitivity Analysis
+
+```{r mvm-grade-no-eope}
+
+#repeat but remove the cases with eoPE
+mvm_grade_noeope_naomit <- mvm_grade_naomit %>% filter(!PE_GA_state == "EOPE")
+
+table(mvm_grade_noeope_naomit$mvm_score_3cat) #52 with high grade MVM, 340 with no MVM
+
+betas_auto_mvm_noeope <- betas_auto[,mvm_grade_noeope_naomit$rgset_colnames]
+dim(betas_auto_mvm_noeope) #x 392
+mvals_auto_mvm_noeope <- mvals_auto[,mvm_grade_noeope_naomit$rgset_colnames]
+dim(mvals_auto_mvm_noeope) #x 392
+
+#set-up models
+mod_HGMVM_noeope_auto_basic <- model.matrix(~ mvm_di, mvm_grade_noeope_naomit,row.names=T)
+mod_HGMVM_noeope_auto <- model.matrix(~ mvm_di + 
+                                 Sex_Predic + 
+                                 Prob_European + 
+                                 Prob_African + 
+                                 ga_continuous, 
+                               mvm_grade_noeope_naomit,row.names=T)
+mod_HGMVM_noeope_auto_cells <- model.matrix(~ mvm_di + 
+                                       Sex_Predic + 
+                                       Prob_European + 
+                                       Prob_African + 
+                                       ga_continuous + 
+                                       Syncytiotrophoblast + 
+                                       Endothelial + 
+                                       Stromal + 
+                                       nRBC, 
+                                     mvm_grade_noeope_naomit,row.names=T)
+
+head(mod_HGMVM_noeope_auto_cells)
+
+#run models
+lm_HGMVM_noeope_auto_basic <-linear_modelling (betas_auto_mvm_noeope,
+                                               mvals_auto_mvm_noeope,
+                                               mod_HGMVM_noeope_auto_basic) %>% filter (term == "mvm_di1")
+lm_HGMVM_noeope_auto <-linear_modelling (betas_auto_mvm_noeope,
+                                         mvals_auto_mvm_noeope,
+                                         mod_HGMVM_noeope_auto) %>% filter (term == "mvm_di1")
+lm_HGMVM_noeope_auto_cells <-linear_modelling (betas_auto_mvm_noeope,
+                                               mvals_auto_mvm_noeope,
+                                               mod_HGMVM_noeope_auto_cells) %>% filter (term == "mvm_di1")
+
+#are there any significant hits? 
+lm_significant_hits(lm_HGMVM_noeope_auto_basic) # 213
+lm_significant_hits(lm_HGMVM_noeope_auto) # 100 + sex + ancestry + gestational age
+lm_significant_hits(lm_HGMVM_noeope_auto_cells) # 10 + sex + ancestry + gestational age + cells
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_HGMVM_noeope_auto_basic$statistic)) #1.010836
+inflation(bacon(teststatistics = lm_HGMVM_noeope_auto$statistic)) #1.018541
+inflation(bacon(teststatistics = lm_HGMVM_noeope_auto_cells$statistic)) #1.042864
+
+```
+
+```{r compare-mvm-models}
+
+
+comp_mvm_models <- lm_HGMVM_noeope_auto %>%
+  dplyr::select(probeID, delB, fdr) %>%
+  dplyr::rename(delB_noeope = delB, fdr_noeope = fdr) %>%
+  left_join((lm_HGMVM_auto %>%
+  dplyr::select(probeID, delB, fdr))) 
+
+sup_fig_sens_a <- comp_mvm_models %>%
+  ggplot(aes(y=delB, x=delB_noeope))+
+  labs(y = expression(paste(Delta*beta, " HG MVM - No MVM")),
+       x = expression(paste(Delta*beta, " HG MVM - No MVM (no EOPE)")))+
+  geom_point()+
+  stat_cor()
+  
+sup_fig_sens_b <- comp_mvm_models %>%
+  ggplot(aes(x=abs(delB-delB_noeope)))+
+  geom_density()+
+  labs(x = expression(paste("|",Delta*Delta*beta, "| With/Without EOPE samples")))
+
+comp_mvm_models %>%
+  filter(fdr<0.05 | fdr_noeope <0.05)%>%
+  ggplot(aes(x=fdr, y=fdr_noeope))+
+  geom_point()
+
+sup_fig_sens_c <- lm_HGMVM_noeope_auto %>%
+  ggplot(aes(x=delB, y=-log10(fdr), color=case_when(
+    fdr < 0.05 & abs(delB) > 0.05 ~ "DMC",
+    .default = "Not Significant"))) +
+  geom_point(alpha=0.6)+
+  geom_hline(yintercept = -log10(0.05), color="grey22", linetype="dashed")+
+  geom_vline(xintercept=c(-0.05,0.05), color="grey22", linetype="dashed")+
+  scale_color_manual(values=c("DMC" ="#033F63","Not Significant" ="grey"))+
+  labs(x=expression(paste(Delta*beta, " HG MVM - No MVM")),y="-log(FDR)",color="",
+       title = "DNAme ~ HG MVM + GA + Sex + Ancestry",
+       subtitle = "100 hits")+
+  annotate(geom="text", x=-0.1, y=1.2, col="black", size = 4, label="FDR < 0.05")+
+  theme(plot.title = element_text(hjust=0.5, size = 14, face="italic"),
+        plot.subtitle = element_text(hjust=0.5, size = 13, color ="#033F63", face="bold"))+
+  ylim(0,4.25)
+
+```
+
+### 2.4 Hits & GO Analysis
+
+```{r mvm-grade-auto-hits}
+
+lm_hg_mvm <- lm_HGMVM_auto_basic%>%
+  dplyr::select(probeID, delB, fdr) %>% dplyr::rename(Simple_delB = delB, Simple_fdr = fdr) %>%
+  left_join((
+    lm_HGMVM_auto %>% 
+      dplyr::select(probeID, delB, fdr) %>% dplyr::rename(Main_delB = delB, Main_fdr = fdr)), by="probeID") %>%
+  left_join((
+    lm_HGMVM_auto_cells %>% 
+      dplyr::select(probeID, delB, fdr) %>% dplyr::rename(Cells_delB = delB, Cells_fdr = fdr)), by="probeID") %>%
+  left_join((
+    autoProbes %>%
+      dplyr::select(probeID, chr, Start_hg38, UCSC_RefGene_Name, Regulatory_Region)), by="probeID")
+
+saveRDS(lm_hg_mvm, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_hg_mvm.rds"))
+
+lm_hg_mvm_hits <- lm_hg_mvm %>%
+  filter(Main_fdr < 0.05 & abs(Main_delB)>0.05)
+dim(lm_hg_mvm_hits) #281 probes 
+
+hg_mvm_hits_cells <- (lm_HGMVM_auto_cells %>% filter(fdr < 0.05 & abs(delB) > 0.05))$probeID
+table(hg_mvm_hits_cells %in% lm_hg_mvm_hits$probeID) #all 17 cells hits overlap with the 281 main hits
+
+# write.xlsx(lm_hg_mvm_hits, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/Supplementary File 1.xlsx"),sheetName="HG MVM", append=T,row.names=F)
+
+eopred_cpgs <- read.csv(here::here("B. Data/B. Reference Data/eopred_cpgs.csv"))
+
+table(lm_hg_mvm_hits$probeID %in% eopred_cpgs$ï..probeID) #5/281
+table(hg_mvm_hits_cells %in% eopred_cpgs$ï..probeID) #1/17
+table(lm_hg_mvm_hits$Regulatory_Region) #mostly enhancers (53.7%)
+table(lm_hg_mvm_hits$Main_delB>0) #240/281 (85.4%)
+
+#Do the hits overlap the cell-type DMCs?
+#Load Victor's Third Trimester Cell DMCs
+cells_dmcs <- read.csv("//fs/teams/RobinsonLab/Victor/Projects/NIH - cells/outs/2_4_cell_dmcs_third.csv")
+table(lm_hg_mvm_hits$probeID  %in% cells_dmcs$cpg) #155/281
+
+go_hg_mvm<- gometh(sig.cpg = lm_hg_mvm_hits$probeID ,
+                    all.cpg = rownames(betas_dasnoob_filt),
+                    array.type = "EPIC")
+
+go_hg_mvm<- go_hg_mvm %>% mutate(GOterm = rownames(go_hg_mvm)) %>% as_tibble %>% arrange(FDR)
+go_hg_mvm %>% filter(FDR < 0.05) %>% nrow() #0 significantly associated terms
+go_hg_mvm[1:10,]
+
+#Do the hits overlap with Sam's 599 EOPE-associated CpGs?
+eope_hits <- read_xlsx("//fs/teams/RobinsonLab/Hannah/05_Projects/EOPE Review Paper/Data/Wilson_2017_PE_hits.xlsx")
+dim(eope_hits) #599
+
+table(lm_hg_mvm_hits$probeID  %in% eope_hits$Probe) #25/281 (8.9%)
+
+```
+
+### 2.5 Plots
+
+```{r mvm-grade-auto-plots}
+
+#fix genes with duplicates 
+#fix genes with duplicates in gene name
+lm_hg_mvm$UCSC_RefGene_Name <- str_extract(lm_hg_mvm$UCSC_RefGene_Name, "[^;]+")
+
+fig_2_a <- lm_hg_mvm %>%
+  ggplot(aes(x=Main_delB, y=-log10(Main_fdr), color=case_when(
+    Main_fdr < 0.05 & abs(Main_delB) > 0.05 ~ "DMC",
+    .default = "Not Significant"))) +
+  geom_point(alpha=0.6)+
+  geom_hline(yintercept = -log10(0.05), color="grey22", linetype="dashed")+
+  geom_vline(xintercept=c(-0.05,0.05), color="grey22", linetype="dashed")+
+  scale_color_manual(values=c("DMC" ="#033F63","Not Significant" ="grey"))+
+  labs(x=expression(paste(Delta*beta, " HG MVM - No MVM")),y="-log(FDR)",color="",
+       title = "DNAme ~ HG MVM + GA + Sex + Ancestry",
+       subtitle = "281 hits")+
+  annotate(geom="text", x=-0.11, y=1.2, col="black", size = 4, label="FDR < 0.05")+
+  geom_text_repel(data=(lm_hg_mvm %>%
+                          filter(!is.na(UCSC_RefGene_Name))%>%
+                          filter(Main_delB < -0.08 & Main_fdr < 0.03 | Main_delB >0.07 & Main_fdr < 0.03)),
+                  aes(x=Main_delB, y=-log10(Main_fdr), label=UCSC_RefGene_Name),
+                      nudge_x = c(0,0.005,0,0,0,0,0.005,-0.01),
+                      nudge_y = c(0.1,-0.5,0,0,0.3,0,-0.1,0),
+  show.legend=F, max.overlaps = Inf, size=3, min.segment.length=0)+
+  theme(plot.title = element_text(hjust=0.5, size = 14, face="italic"),
+        plot.subtitle = element_text(hjust=0.5, size = 13, color ="#033F63", face="bold"))+
+  ylim(0,5)
+
+fig_2_b <- lm_hg_mvm %>%
+  ggplot(aes(x=Cells_delB, y=-log10(Cells_fdr), color=case_when(
+    Cells_fdr < 0.05 & abs(Cells_delB) > 0.05 ~ "DMC",
+    .default = "Not Significant"))) +
+  geom_point(alpha=0.6)+
+  geom_hline(yintercept = -log10(0.05), color="grey22", linetype="dashed")+
+  geom_vline(xintercept=c(-0.05,0.05), color="grey22", linetype="dashed")+
+  scale_color_manual(values=c("DMC" ="#033F63","Not Significant" ="grey"))+
+  labs(x=expression(paste(Delta*beta, " HG MVM - No MVM")),y="-log(FDR)",color="",
+       title = "DNAme ~ HG MVM + GA + Sex + Ancestry + Cells",
+       subtitle = "17 hits")+
+  annotate(geom="text", x=0.1, y=1.2, col="black", size = 4, label="FDR < 0.05")+
+  geom_text_repel(data=(lm_hg_mvm %>%
+                          filter(!is.na(UCSC_RefGene_Name))%>%
+                          filter(Cells_delB < -0.05 & Cells_fdr < 0.05)),
+                  aes(x=Cells_delB, y=-log10(Cells_fdr), label=UCSC_RefGene_Name),
+  show.legend=F, max.overlaps = Inf, size=3, min.segment.length=0, box.padding=0.5)+
+  theme(plot.title = element_text(hjust=0.5, size = 14, face="italic"),
+        plot.subtitle = element_text(hjust=0.5, size = 13, color ="#033F63", face="bold"))+
+  ylim(0,5)
+
+```
+
+#### 2.5.1 Hits Plots
+
+```{r hgmvm-hits-plots-a}
+
+table(grepl("FLNB",autoProbes$UCSC_RefGene_Name))
+
+flnb_probes <- autoProbes %>% filter(chr == "chr3" & as.numeric(Start_hg38) > 58008300 & as.numeric(Start_hg38) < 58012000)
+nrow(flnb_probes) #10
+
+betas_flnb <- betas_dasnoob_filt[rownames(betas_dasnoob_filt) %in% flnb_probes$probeID,, drop=F] %>%
+    as.data.frame() %>%
+    rownames_to_column(var="probeID")%>%
+    pivot_longer(cols=!probeID,
+    names_to = "rgset_colnames",
+    values_to = "beta") %>%
+    left_join(metadata, by="rgset_colnames") %>% #combine with metadata 
+    left_join(flnb_probes, by = "probeID") %>%
+  mutate(DMC = ifelse(probeID %in% eopred_cpgs$ï..probeID, "Yes","No"))
+
+mvm_hits_flnb_plot <- betas_flnb %>%
+  filter(!is.na(mvm_di))%>%
+  ggplot(aes(x=reorder(probeID,Start_hg38), y=beta, color=mvm_score_3cat, fill=mvm_score_3cat))+
+  geom_boxplot(alpha=0.4,outlier.shape=NA, position=position_dodge(0.6), width=0.4)+
+  geom_point(alpha=0.5, position=position_jitterdodge(dodge.width=0.6,jitter.width=0.1), size=2.25,aes(shape=DMC))+
+  ylim(0,1)+
+  scale_color_manual(values = c("darkgrey","#87b8d6","#033F63"),
+                     labels= c("0" = "No MVM","1" = "Low Grade","2" = "High Grade"))+
+  scale_fill_manual(values = c("darkgrey","#87b8d6","#033F63"),
+                     labels= c("0" = "No MVM","1" = "Low Grade","2" = "High Grade"))+
+  scale_shape_manual(values=c(3,19)) +
+  theme(legend.position = "right",
+        plot.title = element_text(face="italic", hjust=0.5))+
+  labs(x="", y= expression(paste("DNAme (",beta,")")), fill = "MVM Pathology",
+       color = "MVM Pathology",
+       title="FLNB", shape="eoPRED CpG")
+mvm_hits_flnb_plot
+
+ggsave("Figure S4.png", plot = mvm_hits_flnb_plot, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 13, height = 5, device = "png")
+
+```
+
+```{r hgmvm-hits-plots-b}
+
+krt_probes <- autoProbes %>% filter(chr == "chr17" & as.numeric(Start_hg38) > 41522055 & as.numeric(Start_hg38) < 41522987)
+nrow(krt_probes) #8
+
+betas_krt <- betas_dasnoob_filt[rownames(betas_dasnoob_filt) %in% krt_probes$probeID,, drop=F] %>%
+    as.data.frame() %>%
+    rownames_to_column(var="probeID")%>%
+    pivot_longer(cols=!probeID,
+    names_to = "rgset_colnames",
+    values_to = "beta") %>%
+    left_join(metadata, by="rgset_colnames") %>% #combine with metadata 
+    left_join(krt_probes, by = "probeID") %>%
+  mutate(DMC = ifelse(probeID %in% lm_hg_mvm_hits$probeID , "Yes","No"))
+
+mvm_hits_krt15_plot <- betas_krt %>%
+  filter(!is.na(mvm_di))%>%
+  ggplot(aes(x=reorder(probeID,Start_hg38), y=beta, color=mvm_score_3cat, fill=mvm_score_3cat))+
+  geom_boxplot(alpha=0.4,outlier.shape=NA, position=position_dodge(0.6), width=0.4)+
+  geom_point(alpha=0.5, position=position_jitterdodge(dodge.width=0.6,jitter.width=0.1), size=2.25,aes(shape=DMC))+
+  ylim(0,1)+
+  scale_color_manual(values = c("darkgrey","#87b8d6","#033F63"),
+                     labels= c("0" = "No MVM","1" = "Low Grade","2" = "High Grade"))+
+  scale_fill_manual(values = c("darkgrey","#87b8d6","#033F63"),
+                     labels= c("0" = "No MVM","1" = "Low Grade","2" = "High Grade"))+
+  scale_shape_manual(values=c(3,19)) +
+  theme(legend.position = "right",
+        plot.title = element_text(face="italic", hjust=0.5))+
+  labs(x="", y= expression(paste("DNAme (",beta,")")), fill = "MVM Pathology",
+       color = "MVM Pathology",
+       title="KRT15-KRT19 Intergenic Region", shape="DMP")
+
+mvm_hits_krt15_plot
+
+ggsave("krt15_krt19_region.png", plot = mvm_hits_krt15_plot, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 12, height = 5, device = "png")
+
+```
+
+#### 2.5.2 Cells Plots
+
+```{r cells-plots-mvm}
+
+## Load Victor's cell-type data
+#metadata
+pDat <- readRDS('//fs/teams/RobinsonLab/Victor/Projects/NIH - cells/data/main/interim/2_3_pDat_contam.rds')
+
+#remove bad samples and filter to tissues of interest
+pDat_filt <- pDat %>% 
+     filter(maternal_contamination_norm_flip < 0.35,
+            !Sample_Name %in% c('PM364_hofb_cs', 'PL293_v_R2', 'PM366_vc_R2', 'P131_hofb_cs')) %>%
+  filter(Tissue %in% c("Endothelial","Hofbauer","Stromal","Syncytiotrophoblast","Trophoblasts","Villi")) 
+pDat_filt[pDat_filt == "Trophoblasts"] <- "Cytotrophoblasts"
+pDat_filt <- pDat_filt %>% mutate(Tissue = factor(Tissue, levels=  c("Endothelial","Hofbauer","Stromal","Syncytiotrophoblast","Cytotrophoblasts","Villi")))
+table(pDat_filt$Tissue)
+
+#only the raw rgset is available, need to normalize
+rgset <- readRDS('//fs/teams/RobinsonLab/Victor/Projects/NIH - cells/data/main/interim/0_1_rgset_raw.rds')
+mset_noob <- preprocessNoob(rgset)
+betas_noob <- getBeta(mset_noob)
+
+saveRDS(betas_noob, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/betas_noob_cell_sorted.rds"))
+
+betas_gene <- t(betas_noob[rownames(betas_noob) %in% lm_hg_mvm_hits$probeID ,
+                            colnames(betas_noob) %in% pDat_filt$Sentrix]) %>%
+  as.data.frame() %>%
+  rownames_to_column(var="Sentrix") 
+
+betas_gene <- betas_gene %>%
+  # reshape into longer format
+  pivot_longer(cols = -Sentrix,
+               names_to = 'probeID', 
+               values_to = 'Beta')  %>%
+  # add tissue and trimester info
+  left_join(pDat_filt %>% select(Sentrix, Trimester, Tissue), by = 'Sentrix') %>%
+  # calculate mean and sd for each cpg for each group
+  group_by(Tissue, Trimester, probeID) %>%
+  summarize(mean = mean(Beta),
+            sd = sd(Beta)) %>%
+  mutate(lower = mean-sd, upper = mean+sd) %>%
+  filter(Trimester == "Third")
+
+labs <- c("\u0394\u03B2 < 0", "\u0394\u03B2 > 0")
+names(labs) <- c(FALSE,TRUE)
+
+## see how the DMPs look in the individual cell types
+
+sup_cells_mvm_a <- betas_gene %>%
+  mutate(lower = ifelse(lower<0,0,lower),
+         upper = ifelse(upper>1,1,upper))%>% #fix error
+  filter(!Tissue == "Villi") %>%
+  left_join(lm_hg_mvm_hits, by="probeID") %>%
+  mutate(Vars = Main_delB >0) %>%
+  filter(Vars == FALSE)%>%
+  ggplot() +
+  geom_linerange(alpha = 0.5, size = 1,
+                 aes(x = reorder(probeID,Main_delB), ymin =lower, ymax = upper, color = Tissue)) +
+  geom_point(alpha = 1, aes(x = probeID, y = mean, color = Tissue), size = 2) +
+  theme(plot.title = element_text(hjust=0.5, size = 16, face="bold"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size=12),
+        legend.position="none",
+        strip.background = element_rect(color="black", fill="grey88")) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0.01,0.01))+
+  scale_color_manual(values= c('#6A1B9A', '#1565C0','#388E3C',    '#E64A19',
+                               '#FBC02D', '#C62828')) +
+  labs(y = "DNA Methylation", x = "", color = '')+
+  facet_wrap(vars(Vars), labeller = labeller(Vars = labs))
+
+sup_cells_mvm_b <- betas_gene %>%
+  mutate(lower = ifelse(lower<0,0,lower),
+         upper = ifelse(upper>1,1,upper))%>% #fix error
+  filter(!Tissue == "Villi") %>%
+  left_join(lm_hg_mvm_hits, by="probeID") %>%
+  mutate(Vars = Main_delB >0) %>%
+  filter(Vars == TRUE)%>%
+  ggplot() +
+  geom_linerange(alpha = 0.5, size = 1,
+                 aes(x = reorder(probeID,Main_delB), ymin =lower, ymax = upper, color = Tissue)) +
+  geom_point(alpha = 1, aes(x = probeID, y = mean, color = Tissue), size = 2) +
+  theme(plot.title = element_text(hjust=0.5, size = 16, face="bold"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        legend.position="right",
+        strip.background = element_rect(color="black", fill="grey88")) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0.01,0.01))+
+  scale_color_manual(values= c('#6A1B9A', '#1565C0','#388E3C',    '#E64A19',
+                               '#FBC02D', '#C62828')) +
+  labs(y="",x = "", color = '')+
+  facet_wrap(vars(Vars), labeller = labeller(Vars = labs))
+
+sup_cells_mvm <- plot_grid(sup_cells_mvm_a, NULL, sup_cells_mvm_b,
+                           nrow=1,
+                           rel_widths=c(1,-0.03,0.7))
+
+sup_cells_mvm
+
+```
+
+## 3.0 FVM
+
+### 3.1 FVM vs. No FVM
+
+```{r lm-model-FVM-auto}
+
+#note that one sample is mistakenly labelled as FVM in the FETAL_VASC_PATH column
+#Use the FETAL_VASC_PATH column to create an updated FETAL_VASC_PATH variable
+table(metadata_naomit$FETAL_VASC_PATH, metadata_naomit$Fetal_vasc_path_3cat)
+metadata_naomit <- metadata_naomit %>% 
+  mutate(FETAL_VASC_PATH = as.factor(ifelse(Fetal_vasc_path_3cat==0,0,1)))
+
+#set-up models
+mod_FVM_auto_basic <- model.matrix(~FETAL_VASC_PATH, metadata_naomit,row.names=T)
+
+mod_FVM_auto <- model.matrix(~FETAL_VASC_PATH+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European,
+                            metadata_naomit,
+                            row.names=T)
+
+mod_FVM_auto_cells <- model.matrix(~FETAL_VASC_PATH+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European +
+                              Syncytiotrophoblast+
+                              Stromal+
+                              Endothelial+
+                              nRBC,
+                            metadata_naomit,
+                            row.names=T)
+
+head(mod_FVM_auto_cells)
+
+#run regression
+lm_FVM_auto_basic <-linear_modelling (betas_auto,mvals_auto,mod_FVM_auto_basic) %>% filter (term == "FETAL_VASC_PATH1")
+lm_FVM_auto <-linear_modelling (betas_auto,mvals_auto,mod_FVM_auto) %>% filter (term == "FETAL_VASC_PATH1")
+lm_FVM_auto_cells <-linear_modelling (betas_auto,mvals_auto,mod_FVM_auto_cells) %>% filter (term == "FETAL_VASC_PATH1")
+
+#are there any significant hits?
+lm_significant_hits(lm_FVM_auto_basic)
+lm_significant_hits(lm_FVM_auto)
+lm_significant_hits(lm_FVM_auto_cells)
+
+lm_FVM_auto %>% filter(fdr<0.05 &abs(delB)>0.05) %>%
+  arrange(probeID) %>%
+  left_join(autoProbes, by="probeID")
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_FVM_auto_basic$statistic)) #1.074454 
+inflation(bacon(teststatistics = lm_FVM_auto$statistic)) #1.040359   
+inflation(bacon(teststatistics = lm_FVM_auto_cells$statistic)) #0.9973838 
+
+```
+
+### 3.2 High-grade FVM vs. No FVM
+
+```{r lm-model-HGFVM-auto}
+
+#remove samples with low grade FVM
+fvm_grade_naomit <- metadata_naomit %>% filter(!Fetal_vasc_path_3cat == 1) %>%
+  mutate(Fetal_vasc_path_3cat = as.numeric(Fetal_vasc_path_3cat))
+table(fvm_grade_naomit$Fetal_vasc_path_3cat) #37 HG FVM, 321 No FVM
+
+betas_auto_fvm <- betas_auto[,fvm_grade_naomit$rgset_colnames]
+mvals_auto_fvm <- mvals_auto[,fvm_grade_naomit$rgset_colnames]
+dim(mvals_auto_fvm) #x358
+
+#set-up models
+mod_HGFVM_auto_basic <- model.matrix(~FETAL_VASC_PATH,fvm_grade_naomit,row.names=T)
+
+mod_HGFVM_auto <- model.matrix(~FETAL_VASC_PATH+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European,
+                            fvm_grade_naomit,
+                            row.names=T)
+
+mod_HGFVM_auto_cells <- model.matrix(~FETAL_VASC_PATH+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European +
+                              Syncytiotrophoblast+
+                              Stromal+
+                              Endothelial+
+                              nRBC,
+                            fvm_grade_naomit,
+                            row.names=T)
+
+head(mod_HGFVM_auto_cells)
+
+#run regression
+lm_HGFVM_auto_basic <-linear_modelling (betas_auto_fvm,mvals_auto_fvm,mod_HGFVM_auto_basic) %>% filter (term == "FETAL_VASC_PATH1")
+lm_HGFVM_auto <-linear_modelling (betas_auto_fvm,mvals_auto_fvm,mod_HGFVM_auto) %>% filter (term == "FETAL_VASC_PATH1")
+lm_HGFVM_auto_cells <-linear_modelling (betas_auto_fvm,mvals_auto_fvm,mod_HGFVM_auto_cells) %>% filter (term == "FETAL_VASC_PATH1")
+
+#are there any significant hits?
+lm_significant_hits(lm_HGFVM_auto_basic)
+lm_significant_hits(lm_HGFVM_auto)
+lm_significant_hits(lm_HGFVM_auto_cells)
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_HGFVM_auto_basic$statistic)) #1.054842  
+inflation(bacon(teststatistics = lm_HGFVM_auto$statistic)) #1.046303 
+inflation(bacon(teststatistics = lm_HGFVM_auto_cells$statistic)) #0.9479838 
+
+```
+
+#### 3.2.1 Hits
+
+```{r fvm-grade-auto-hits}
+
+fvm_hits <- lm_FVM_auto %>% filter(fdr <0.05 & abs(delB) > 0.05)
+hg_fvm_hits <- lm_HGFVM_auto %>% filter(fdr <0.05 & abs(delB) > 0.05) 
+dim(hg_fvm_hits) #56
+table(hg_fvm_hits$delB>0)
+table(hg_fvm_hits$probeID %in% fvm_hits$probeID) #No
+
+#Do the hits overlap eoPRED CpGs?
+table(hg_fvm_hits$probeID %in% eopred_cpgs$ï..probeID) #0
+
+#Do the hits overlap with MVM CpGs?
+table(hg_fvm_hits$probeID %in% lm_hg_mvm_hits$probeID ) #0
+table(fvm_hits$probeID %in% lm_hg_mvm_hits$probeID )  #0
+
+## Are the hits cell specific DMCs?
+table(hg_fvm_hits$probeID %in% cells_dmcs$cpg) #48/56
+
+## GO analysis
+go_hg_fvm<- gometh(sig.cpg = hg_fvm_hits$probeID,
+                    all.cpg = rownames(betas_auto),
+                    array.type = "EPIC")
+
+go_hg_fvm<- go_hg_fvm %>% mutate(GOterm = rownames(go_hg_fvm)) %>% as_tibble %>% arrange(FDR)
+go_hg_fvm %>% filter(FDR < 0.05) %>% nrow() #0 significantly associated terms
+go_hg_fvm[1:10,]
+
+
+lm_hg_fvm <- lm_HGFVM_auto_basic %>%
+  dplyr::select(probeID, delB, fdr) %>% dplyr::rename(Simple_delB = delB, Simple_fdr = fdr) %>%
+  left_join((
+    lm_HGFVM_auto %>% 
+      dplyr::select(probeID, delB, fdr) %>% dplyr::rename(Main_delB = delB, Main_fdr = fdr)), by="probeID") %>%
+  left_join((
+    lm_HGFVM_auto_cells%>% 
+      dplyr::select(probeID, delB, fdr) %>% dplyr::rename(Cells_delB = delB, Cells_fdr = fdr)), by="probeID") %>%
+  left_join((
+    autoProbes %>%
+      dplyr::select(probeID, chr, Start_hg38, UCSC_RefGene_Name, Regulatory_Region)
+  ), by="probeID")
+
+saveRDS(lm_hg_fvm, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_hg_fvm.rds"))
+
+lm_hg_fvm_hits <- lm_hg_fvm %>%
+  filter(Main_fdr<0.05 & abs(Main_delB) >0.05)
+dim(lm_hg_fvm_hits) #56 probes
+
+table(lm_hg_fvm_hits$Regulatory_Region)
+
+# write.xlsx(lm_hg_fvm_hits, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/Supplementary File 1.xlsx"),sheetName="HG FVM", append=T,row.names=F)
+
+```
+
+#### 3.2.2 Plots
+
+```{r fvm-grade-auto-plots}
+
+#fix genes with duplicates in gene name
+lm_hg_fvm$UCSC_RefGene_Name <- str_extract(lm_hg_fvm$UCSC_RefGene_Name, "[^;]+")
+
+fig_2_c <- lm_hg_fvm %>%
+  ggplot(aes(x=Main_delB, y=-log10(Main_fdr), color=case_when(
+    Main_fdr < 0.05 & abs(Main_delB) > 0.05 ~ "DMP",
+    .default = "Not Significant"))) +
+  geom_point(alpha=0.6)+
+  geom_hline(yintercept = -log10(0.05), color="grey22", linetype="dashed")+
+  geom_vline(xintercept=c(-0.05,0.05), color="grey22", linetype="dashed")+
+  scale_color_manual(values=c("DMP" ="#3b6b4a","Not Significant" ="grey"))+
+  labs(x=expression(paste(Delta*beta, " HG FVM - No FVM")),y="-log(FDR)",color="",
+       title = "DNAme ~ HG FVM + GA + Sex + Ancestry",
+       subtitle = "56 hits")+
+  theme(plot.title = element_text(hjust=0.5, size = 14, face="italic"),
+        plot.subtitle = element_text(hjust=0.5, size = 13, color ="#3b6b4a", face="bold"),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16))+
+  annotate(geom="text", x=-0.1, y=1.2, col="black", size = 4, label="FDR < 0.05")+
+  geom_text_repel(data=(lm_hg_fvm %>%
+                          filter(!is.na(UCSC_RefGene_Name)) %>%
+                          filter(abs(Main_delB) > 0.065 & Main_fdr < 0.03|
+                                                   abs(Main_delB) >0.05 & Main_fdr<0.01)),
+                  aes(x=Main_delB, y=-log10(Main_fdr), label=UCSC_RefGene_Name),
+  show.legend=F, max.overlaps = Inf, size=3, min.segment.length=0.2)+
+  ylim(0,3.4)
+
+fig_2_d <- lm_hg_fvm %>%
+  ggplot(aes(x=Cells_delB, y=-log10(Cells_fdr), color=case_when(
+    Cells_fdr < 0.05 & abs(Cells_delB) > 0.05 ~ "DMP",
+    .default = "Not Significant"))) +
+  geom_point(alpha=0.6)+
+  geom_hline(yintercept = -log10(0.05), color="grey22", linetype="dashed")+
+  geom_vline(xintercept=c(-0.05,0.05), color="grey22", linetype="dashed")+
+  scale_color_manual(values=c("DMP" ="#3b6b4a","Not Significant" ="grey"))+
+  labs(x=expression(paste(Delta*beta, " HG FVM - No FVM")),y="-log(FDR)",color="",
+       title = "DNAme ~ HG FVM + GA + Sex + Ancestry + Cells",
+       subtitle = "0 hits")+
+  theme(plot.title = element_text(hjust=0.5, size = 14, face="italic"),
+        plot.subtitle = element_text(hjust=0.5, size = 13, color ="#3b6b4a", face="bold"),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16))+
+  annotate(geom="text", x=0.075, y=1.2, col="black", size = 4, label="FDR < 0.05")+
+  ylim(0,3.4)
+
+```
+
+#### 3.2.3 Cells Plots
+
+```{r cells-plots-fvm, warning=F}
+
+betas_gene2 <- t(betas_noob[rownames(betas_noob) %in% lm_hg_fvm_hits$probeID,
+                            colnames(betas_noob) %in% pDat_filt$Sentrix]) %>%
+  as.data.frame() %>%
+  rownames_to_column(var="Sentrix") 
+
+betas_gene2 <- betas_gene2 %>%
+  # reshape into longer format
+  pivot_longer(cols = -Sentrix,
+               names_to = 'probeID', 
+               values_to = 'Beta')  %>%
+  # add tissue and trimester info
+  left_join(pDat_filt %>% select(Sentrix, Trimester, Tissue), by = 'Sentrix') %>%
+  # calculate mean and sd for each cpg for each group
+  group_by(Tissue, Trimester, probeID) %>%
+  summarize(mean = mean(Beta),
+            sd = sd(Beta)) %>%
+  mutate(lower = mean-sd, upper = mean+sd) %>%
+  filter(Trimester == "Third")
+
+## see how the DMPs look in the individual cell types
+betas_gene2 %>%
+  filter(probeID %in% lm_hg_fvm_hits$probeID)%>%
+  left_join(lm_hg_fvm_hits, by="probeID") %>%
+  mutate(Vars = Main_delB >0) %>%
+  ggplot(aes(y=mean, x=Tissue, color=Tissue))+
+  geom_point()+
+  geom_boxplot(alpha=0.5,outlier.shape=NA)+
+  theme(legend.position="none")+
+  facet_wrap(vars(Vars), labeller = labeller(Vars = labs))+
+  labs(y="Mean Beta")
+
+betas_gene2 %>%
+  filter(probeID %in% lm_hg_fvm_hits$probeID)%>%
+  left_join(lm_hg_fvm_hits, by="probeID") %>%
+  mutate(Vars = Main_delB >0) %>%
+  ggplot(aes(y=mean, x=Tissue, color=probeID, group=probeID))+
+  geom_point()+
+  geom_line()+
+  theme(legend.position="none")+
+  facet_wrap(vars(Vars), labeller = labeller(Vars = labs))+
+  labs(y="Mean Beta")
+
+## plot all of the 54 DMPs by individual cell-type
+sup_cells_fvm_a <- betas_gene2 %>%
+  filter(!Tissue == "Villi") %>%
+  left_join(lm_hg_fvm_hits, by="probeID") %>%
+  mutate(Vars = Main_delB >0) %>%
+  filter(Vars == FALSE) %>%
+  ggplot() +
+  geom_linerange(alpha = 0.5, size = 1,
+                 aes(x = probeID, ymin =lower, ymax = upper, color = Tissue)) +
+  geom_point(alpha = 1, aes(x = reorder(probeID,Main_delB), y = mean, color = Tissue), size = 2) +
+  theme(plot.title = element_text(hjust=0.5, size = 16, face="bold"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_text(size=12),
+        legend.position="none",
+        strip.background = element_rect(color="black", fill="grey88")) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0.01,0.01))+
+  scale_color_manual(values= c('#6A1B9A', '#1565C0','#388E3C',    '#E64A19',
+                               '#FBC02D', '#C62828')) +
+  labs(y = "DNA Methylation", x = "", color = '')+
+  facet_wrap(vars(Vars), labeller = labeller(Vars = labs), nrow=1)
+
+sup_cells_fvm_b <- betas_gene2 %>%
+  filter(!Tissue == "Villi") %>%
+  left_join(lm_hg_fvm_hits, by="probeID") %>%
+  mutate(Vars = Main_delB >0) %>%
+  filter(Vars == TRUE) %>%
+  ggplot() +
+  geom_linerange(alpha = 0.5, size = 1,
+                 aes(x = probeID, ymin =lower, ymax = upper, color = Tissue)) +
+  geom_point(alpha = 1, aes(x = reorder(probeID,Main_delB), y = mean, color = Tissue), size = 2) +
+  theme(plot.title = element_text(hjust=0.5, size = 16, face="bold"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        legend.position="right",
+        strip.background = element_rect(color="black", fill="grey88")) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0.01,0.01))+
+  scale_color_manual(values= c('#6A1B9A', '#1565C0','#388E3C',    '#E64A19',
+                               '#FBC02D', '#C62828')) +
+  labs(y = "", x = "", color = "")+
+  facet_wrap(vars(Vars), labeller = labeller(Vars = labs), nrow=1)
+
+sup_cells_fvm <- plot_grid(sup_cells_fvm_a, NULL, sup_cells_fvm_b, nrow=1, rel_widths=c(0.6,-0.03,1))
+sup_cells_fvm
+
+```
+
+## 4.0 AI
+
+### 4.1 AI vs. No AI
+
+```{r lm-model-AI-auto}
+
+table(metadata_naomit$acute_inflammation_3cat)
+
+#set-up models
+mod_AI_auto_basic <- model.matrix(~ACUTE_INFLAMMATION,metadata_naomit,row.names=T)
+
+mod_AI_auto <- model.matrix(~ACUTE_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European,
+                            metadata_naomit,
+                            row.names=T)
+
+mod_AI_auto_cells <- model.matrix(~ACUTE_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European +
+                              Syncytiotrophoblast+
+                              Stromal+
+                              Endothelial+
+                              nRBC,
+                            metadata_naomit,
+                            row.names=T)
+
+head(mod_AI_auto_cells)
+
+#run regression
+lm_AI_auto_basic <-linear_modelling (betas_auto,mvals_auto,mod_AI_auto_basic) %>% filter (term == "ACUTE_INFLAMMATION1")
+lm_AI_auto <-linear_modelling (betas_auto,mvals_auto,mod_AI_auto) %>% filter (term == "ACUTE_INFLAMMATION1")
+lm_AI_auto_cells <-linear_modelling (betas_auto,mvals_auto,mod_AI_auto_cells) %>% filter (term == "ACUTE_INFLAMMATION1")
+
+#are there any significant hits?
+lm_significant_hits(lm_AI_auto_basic)
+lm_significant_hits(lm_AI_auto)
+lm_significant_hits(lm_AI_auto_cells)
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_AI_auto_basic$statistic)) #0.976918
+inflation(bacon(teststatistics = lm_AI_auto$statistic)) #0.9073235 
+inflation(bacon(teststatistics = lm_AI_auto_cells$statistic)) #0.9587326  
+
+```
+
+### 4.2 High-grade AI vs. No AI
+
+```{r lm-model-HGAI-auto}
+
+#remove samples with low grade AI
+ai_grade_naomit <- metadata_naomit %>% filter(!acute_inflammation_3cat == 1)
+table(ai_grade_naomit$acute_inflammation_3cat) #216 No AI, 65 HG AI
+
+betas_auto_ai <- betas_auto[,ai_grade_naomit$rgset_colnames]
+mvals_auto_ai <- mvals_auto[,ai_grade_naomit$rgset_colnames]
+dim(mvals_auto_ai) #x281
+
+#set-up models
+mod_HGAI_auto_basic <- model.matrix(~ACUTE_INFLAMMATION,ai_grade_naomit,row.names=T)
+
+mod_HGAI_auto <- model.matrix(~ACUTE_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European,
+                            ai_grade_naomit,
+                            row.names=T)
+
+mod_HGAI_auto_cells <- model.matrix(~ACUTE_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European +
+                              Syncytiotrophoblast+
+                              Stromal+
+                              Endothelial+
+                              nRBC,
+                            ai_grade_naomit,
+                            row.names=T)
+
+head(mod_HGAI_auto_cells)
+
+#run regression
+lm_HGAI_auto_basic <-linear_modelling (betas_auto_ai,mvals_auto_ai,mod_HGAI_auto_basic) %>% filter (term == "ACUTE_INFLAMMATION1")
+lm_HGAI_auto <-linear_modelling (betas_auto_ai,mvals_auto_ai,mod_HGAI_auto) %>% filter (term == "ACUTE_INFLAMMATION1")
+lm_HGAI_auto_cells <-linear_modelling (betas_auto_ai,mvals_auto_ai,mod_HGAI_auto_cells) %>% filter (term == "ACUTE_INFLAMMATION1")
+
+#are there any significant hits?
+lm_significant_hits(lm_HGAI_auto_basic)
+lm_significant_hits(lm_HGAI_auto)
+lm_significant_hits(lm_HGAI_auto_cells)
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_HGAI_auto_basic$statistic)) #0.9357896  
+inflation(bacon(teststatistics = lm_HGAI_auto$statistic)) #0.9879485
+inflation(bacon(teststatistics = lm_HGAI_auto_cells$statistic)) #1.032015  
+
+```
+
+## 5.0 CI
+
+### 5.1 CI vs. No CI
+
+```{r lm-model-CI-auto}
+
+table(metadata_naomit$chronic_inflammation_3cat)
+
+#set-up models
+mod_CI_auto_basic <- model.matrix(~CHRONIC_INFLAMMATION,metadata_naomit,row.names=T)
+
+mod_CI_auto <- model.matrix(~CHRONIC_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European,
+                            metadata_naomit,
+                            row.names=T)
+
+mod_CI_auto_cells <- model.matrix(~CHRONIC_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European +
+                              Syncytiotrophoblast+
+                              Stromal+
+                              Endothelial+
+                              nRBC,
+                            metadata_naomit,
+                            row.names=T)
+
+head(mod_CI_auto_cells)
+
+#run regression
+lm_CI_auto_basic <-linear_modelling (betas_auto,mvals_auto,mod_CI_auto_basic) %>% filter (term == "CHRONIC_INFLAMMATION1")
+lm_CI_auto <-linear_modelling (betas_auto,mvals_auto,mod_CI_auto) %>% filter (term == "CHRONIC_INFLAMMATION1")
+lm_CI_auto_cells <-linear_modelling (betas_auto,mvals_auto,mod_CI_auto_cells) %>% filter (term == "CHRONIC_INFLAMMATION1")
+
+#are there any significant hits?
+lm_significant_hits(lm_CI_auto_basic)
+lm_significant_hits(lm_CI_auto)
+lm_significant_hits(lm_CI_auto_cells)
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_CI_auto_basic$statistic)) #0.9158924
+inflation(bacon(teststatistics = lm_CI_auto$statistic)) #0.9259814  
+inflation(bacon(teststatistics = lm_CI_auto_cells$statistic)) #0.9280374  
+
+```
+
+### 5.2 High-grade CI vs. No CI
+
+```{r lm-model-HGCI-auto}
+
+#remove samples with low grade CI
+ci_grade_naomit <- metadata_naomit %>% filter(!chronic_inflammation_3cat == 1)
+table(ci_grade_naomit$chronic_inflammation_3cat) #217 No CI, 105 HG CI
+
+betas_auto_ci <- betas_auto[,ci_grade_naomit$rgset_colnames]
+mvals_auto_ci <- mvals_auto[,ci_grade_naomit$rgset_colnames]
+dim(mvals_auto_ci) #x322
+
+#set-up models
+mod_HGCI_auto_basic <- model.matrix(~CHRONIC_INFLAMMATION,ci_grade_naomit,row.names=T)
+
+mod_HGCI_auto <- model.matrix(~CHRONIC_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European,
+                            ci_grade_naomit,
+                            row.names=T)
+
+mod_HGCI_auto_cells <- model.matrix(~CHRONIC_INFLAMMATION+
+                              ga_continuous+
+                              Sex_Predic+
+                              Prob_African+
+                              Prob_European +
+                              Syncytiotrophoblast+
+                              Stromal+
+                              Endothelial+
+                              nRBC,
+                            ci_grade_naomit,
+                            row.names=T)
+
+head(mod_HGCI_auto_cells)
+
+#run regression
+lm_HGCI_auto_basic <-linear_modelling (betas_auto_ci,mvals_auto_ci,mod_HGCI_auto_basic)%>% filter (term == "CHRONIC_INFLAMMATION1")
+lm_HGCI_auto <-linear_modelling (betas_auto_ci,mvals_auto_ci,mod_HGCI_auto)%>% filter (term == "CHRONIC_INFLAMMATION1")
+lm_HGCI_auto_cells <-linear_modelling (betas_auto_ci,mvals_auto_ci,mod_HGCI_auto_cells)%>% filter (term == "CHRONIC_INFLAMMATION1")
+
+#are there any significant hits?
+lm_significant_hits(lm_HGCI_auto_basic)
+lm_significant_hits(lm_HGCI_auto)
+lm_significant_hits(lm_HGCI_auto_cells)
+
+#calculate inflation using the bacon package
+inflation(bacon(teststatistics = lm_HGCI_auto_basic$statistic)) #0.96176 
+inflation(bacon(teststatistics = lm_HGCI_auto$statistic)) #0.971272 
+inflation(bacon(teststatistics = lm_HGCI_auto_cells$statistic)) #1.024292
+
+```
+
+## 6.0 Manuscript Figures
+
+### 6.1 Figure 2.0
+
+```{r fig-4}
+
+fig_2 <- plot_grid(fig_2_a, NULL,fig_2_b, 
+                   NULL, NULL, NULL,
+                   fig_2_c, NULL, fig_2_d,
+                   labels = c("A.","","B.","","","","C.","","D."), nrow = 3, ncol=3,
+                   rel_widths = c(1,0.1,1), rel_heights = c(1,0.1,1))
+
+fig_2
+
+ggsave("Figure 2.png", plot = fig_2, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 11, height =9, device = "png")
+
+```
+
+### 6.2 Supplementary Figure 2
+
+```{r q-q plots}
+
+qq_plot <- function(df){
+  
+  plot <- df %>%
+    dplyr::select(p.value) %>%
+    arrange(p.value) %>%
+    mutate(Exp.p.value = row_number()/nrow(df)) %>% #calculate based on uniform distribution 
+    ggplot(aes(x=-log10(Exp.p.value), y=-log10(p.value)))+
+    geom_point()+
+    labs(x="Expected -log10(p-value)", y="Observed -log10(p-value)")+
+    geom_abline(slope=1, intercept =0)+
+    annotate(geom="text", x=1, y=5, col="black", size = 4,
+             label=paste0("\u03BB = ", round(inflation(bacon(teststatistics = df$statistic)),3)))
+  return(plot)
+  
+}
+
+title_ai <- ggdraw() + draw_label("AI",fontface = 'bold', size=12,hjust = 0.5) 
+title_ci <- ggdraw() + draw_label("CI",fontface = 'bold', size=12,hjust = 0.5)
+title_fvm <- ggdraw() + draw_label("FVM",fontface = 'bold', size=12,hjust = 0.5)
+title_mvm <- ggdraw() + draw_label("MVM",fontface = 'bold', size=12,hjust = 0.5)
+
+title_hgai <- ggdraw() + draw_label("HG AI",fontface = 'bold', size=12,hjust = 0.5) 
+title_hgci <- ggdraw() + draw_label("HG CI",fontface = 'bold', size=12,hjust = 0.5)
+title_hgfvm <- ggdraw() + draw_label("HG FVM",fontface = 'bold', size=12,hjust = 0.5)
+title_hgmvm <- ggdraw() + draw_label("HG MVM",fontface = 'bold', size=12,hjust = 0.5)
+
+qq_all <- plot_grid(
+  
+  title_ai,
+  title_ci,
+  title_fvm,
+  title_mvm,
+  
+  qq_plot(lm_AI_auto_basic),
+  qq_plot(lm_CI_auto_basic),
+  qq_plot(lm_FVM_auto_basic),
+  qq_plot(lm_mvm_auto_basic),
+  
+  qq_plot(lm_AI_auto),
+  qq_plot(lm_CI_auto),
+  qq_plot(lm_FVM_auto),
+  qq_plot(lm_mvm_auto),
+  
+  qq_plot(lm_AI_auto_cells),
+  qq_plot(lm_CI_auto_cells),
+  qq_plot(lm_FVM_auto_cells),
+  qq_plot(lm_mvm_cells),
+  
+  title_hgai,
+  title_hgci,
+  title_hgfvm,
+  title_hgmvm,
+  
+  qq_plot(lm_HGAI_auto_basic),
+  qq_plot(lm_HGCI_auto_basic),
+  qq_plot(lm_HGFVM_auto_basic),
+  qq_plot(lm_HGMVM_auto_basic),
+  
+  qq_plot(lm_HGAI_auto),
+  qq_plot(lm_HGCI_auto),
+  qq_plot(lm_HGFVM_auto),
+  qq_plot(lm_HGMVM_auto),
+  
+  qq_plot(lm_HGAI_auto_cells),
+  qq_plot(lm_HGCI_auto_cells),
+  qq_plot(lm_HGFVM_auto_cells),
+  qq_plot(lm_HGMVM_auto_cells),
+  
+  nrow=8, ncol=4,
+  rel_heights = c(0.2,1,1,1,0.2,1,1,1)
+)
+
+ggsave("Figure S2.png", plot = qq_all, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 15, height =19, device = "png")
+
+```
+
+### 6.3 Supplementary Figure 3
+
+```{r sup-fig-4}
+
+sup_fig_sens <- plot_grid(sup_fig_sens_a, sup_fig_sens_b, sup_fig_sens_c,
+                          nrow=2, ncol=2, 
+                          labels = c("A.","B.", "C."))
+
+ggsave("Figure S3.png", plot = sup_fig_sens, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 13, height = 8, device = "png")
+
+```
+
+### 6.4 Supplementary Figure 5
+
+```{r sup-fig-6}
+
+title_mvm <- ggdraw() + 
+  draw_label("High-grade MVM DMPs",
+    fontface = 'bold',
+    size=16,
+    hjust = 0.5) 
+
+title_fvm <- ggdraw() + 
+  draw_label("High-grade FVM DMPs",
+    fontface = 'bold',
+    size=16,
+    hjust = 0.5) 
+
+sup_cells_figure <- plot_grid(title_mvm, sup_cells_mvm, 
+                              title_fvm, sup_cells_fvm,
+                              nrow=4, rel_heights=c(0.1,1,0.1,1),
+                              labels=c("A.","","B.",""))
+
+ggsave("Figure S6.png", plot = sup_cells_figure, path = here::here("D. Pathology Project/02_Outputs/AA. Cleaned/"), width = 16, height =12, device = "png")
+
+
+```
+
+## Save Outputs
+
+```{r save}
+
+saveRDS(lm_mvm_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_mvm_auto_basic.rds"))
+saveRDS(lm_mvm_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_mvm_auto.rds"))
+saveRDS(lm_mvm_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_mvm_cells.rds"))
+
+saveRDS(lm_HGMVM_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGMVM_auto_basic.rds"))
+saveRDS(lm_HGMVM_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGMVM_auto.rds"))
+saveRDS(lm_HGMVM_auto_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGMVM_auto_cells.rds"))
+
+saveRDS(lm_FVM_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_FVM_auto_basic.rds"))
+saveRDS(lm_FVM_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_FVM_auto.rds"))
+saveRDS(lm_FVM_auto_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_FVM_auto_cells.rds"))
+
+saveRDS(lm_HGFVM_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGFVM_auto_basic.rds"))
+saveRDS(lm_HGFVM_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGFVM_auto.rds"))
+saveRDS(lm_HGFVM_auto_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGFVM_auto_cells.rds"))
+
+saveRDS(lm_AI_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_AI_auto_basic.rds"))
+saveRDS(lm_AI_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_AI_auto.rds"))
+saveRDS(lm_AI_auto_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_AI_auto_cells.rds"))
+
+saveRDS(lm_HGAI_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGAI_auto_basic.rds"))
+saveRDS(lm_HGAI_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGAI_auto.rds"))
+saveRDS(lm_HGAI_auto_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGAI_auto_cells.rds"))
+
+saveRDS(lm_CI_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_CI_auto_basic.rds"))
+saveRDS(lm_CI_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_CI_auto.rds"))
+saveRDS(lm_CI_auto_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_CI_auto_cells.rds"))
+
+saveRDS(lm_HGCI_auto_basic, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGCI_auto_basic.rds"))
+saveRDS(lm_HGCI_auto, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGCI_auto.rds"))
+saveRDS(lm_HGCI_auto_cells, here::here("D. Pathology Project/02_Outputs/AA. Cleaned/LM objects/lm_HGCI_auto_cells.rds"))
+
+```
+
+
+## sessionInfo()
+
+```{r}
+
+sessionInfo()
+
+```
