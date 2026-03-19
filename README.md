@@ -1,5 +1,5 @@
 # DNA methylation profiling of placental histopathology
-In the paper *Characterizing placental dysfunction with DNA methylation profiling and placental histopathology* (Placenta, 2026) we evaluated the association of DNA methylation with the four major classes of placental pathology: maternal vascular malperfusion (MVM), fetal vascular malperfusion (FVM), acute and chronic inflammation (AI and CI).
+In the paper *Characterizing placental dysfunction with DNA methylation profiling and placental histopathology* (Placenta, 2026; PMID: 41689925) we evaluated the association of DNA methylation with the four major classes of placental pathology: maternal vascular malperfusion (MVM), fetal vascular malperfusion (FVM), acute and chronic inflammation (AI and CI).
 
 The **Stress Pregnancy and Health (SPAH)** dataset was used. It is available at [GSE307289](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE307289). Additional pathology information is available upon request to the authors. 
 
